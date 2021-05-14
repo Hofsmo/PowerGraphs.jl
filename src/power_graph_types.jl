@@ -1,4 +1,5 @@
 using LightGraphs
+using GraphDataFrameBridge
 using MetaGraphs
 using TOML
 
@@ -26,7 +27,10 @@ function RadialPowerGraph()
 end
 
 function RadialPowerGraph(case_file::String)
-    mpc = Case(case_file::String)
+	RadialPowerGraph(Case(case_file::String))
+end
+
+function RadialPowerGraph(mpc::Case)
     G, ref_bus = read_case!(mpc)
 	radial = subgraph(G, G[ref_bus, :name])
     RadialPowerGraph(G, mpc, ref_bus, radial)
@@ -42,27 +46,26 @@ function PowerGraph(case_file::String)
 end
 
 function read_case!(mpc::Case)
-    G = MetaDiGraph(nrow(mpc.bus))
+	G = MetaDiGraph(mpc.branch, :f_bus, :t_bus)
 
     ref_bus = NaN
 	for bus in eachrow(mpc.bus)
         if bus[:type] == 3
-			ref_bus = string(DataFrames.row(bus))
+			ref_bus = string(bus.ID)
         end
-        set_prop!(G, DataFrames.row(bus), :name, bus.ID)
     end
     
     set_indexing_prop!(G, :name)
 	
 	if size(mpc.switch, 1) >= 1 
 		# Check if switches have propert closed.
-		if :closed ∉ names(mpc.switch)
+		if "closed" ∉ names(mpc.switch)
 			println("I don't know switch status.")
 			println("All switches will be assumed closed.")
 			mpc.switch[!, :closed] .= true
 		end
 		# Check if switches have column breaker
-		if :breaker ∉ names(mpc.switch)
+		if "breaker" ∉ names(mpc.switch)
 			println("I don't know if switch or circuit breaker.")
 			println("All switchgear will be assumed to be switches.")
 			mpc.switch[!, :breaker] .= false
@@ -70,9 +73,6 @@ function read_case!(mpc::Case)
 	end
     
 	for branch in eachrow(mpc.branch)
-		# First add the edge to the graph
-		add_edge!(G, G[string(branch.f_bus), :name], G[string(branch.t_bus), :name])
-
         # I set the following rule for the property stored on each edge:
         # :switch = [-1 => no switch;
         #            0  => open; # information stored on column switch.closed[1]

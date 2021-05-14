@@ -24,6 +24,7 @@ mutable struct Fasad_Case
 	delivery_points::DataFrame
 	fault_indicators::DataFrame
 	gen_cost::DataFrame
+	trans_node::String
 end
 
 function Case()::Case
@@ -49,26 +50,27 @@ function Fasad_Case()::Fasad_Case
 	delivery_points = DataFrame()
 	fault_indicators = DataFrame()
     gencost = DataFrame()
-    Fasad_Case(baseMVA, transformers, lines, switchgear, nodes, delivery_points, fault_indicators, gencost)
+	trans_node = ""
+    Fasad_Case(baseMVA, transformers, lines, switchgear, nodes, delivery_points, fault_indicators, gencost,
+			   trans_node)
 end
 
 function Case(fname::String)::Case
-	mpc = Case()
-	conf = TOML.parsefile(fname)
-	dir = splitdir(fname)[1]
-	for (field, file) in conf["files"]
-		 temp = CSV.File(joinpath(dir, file)) |> DataFrame
-		# Convert IDs to string
-		 for key in ["ID", "f_bus", "t_bus"]
-			 if key in names(temp)
-				 temp[!, key] = string.(temp[:, key])
-			 end
-		 end
-		 setfield!(mpc, Symbol(field), temp)
-	end
-	mpc.baseMVA = conf["configuration"]["baseMVA"]
-
-	return mpc
+    mpc = Case()
+    conf = TOML.parsefile(fname)
+    dir = splitdir(fname)[1]
+    for (field, file) in conf["files"]
+         temp = CSV.File(joinpath(dir, file)) |> DataFrame
+        # Convert IDs to string
+         for key in ["ID", "bus", "f_bus", "t_bus"]
+             if key in names(temp)
+                 temp[!, key] = string.(temp[:, key])
+             end
+         end
+         setfield!(mpc, Symbol(field), temp)
+    end
+    mpc.baseMVA = conf["configuration"]["baseMVA"]
+    return mpc
 end
 
 function Fasad_Case(fname::String)::Fasad_Case
@@ -77,11 +79,13 @@ function Fasad_Case(fname::String)::Fasad_Case
 	conf = TOML.parsefile(fname)
 	dir = splitdir(fname)[1]
 	for (field, files) in conf["files"]
+		df = DataFrame()
 		for file in files # instead of setfield I should use an append-style command
-			setfield!(mpc_fasad, Symbol(field), CSV.File(joinpath(dir, file)) |> DataFrame)
+			df = vcat(df, CSV.File(joinpath(dir, file)) |> DataFrame)
 		end
+				setfield!(mpc_fasad, Symbol(field), df)
 	end
-
+	mpc_fasad.trans_node = conf["transmission_grid"]
 	return mpc_fasad
 end
 
@@ -133,33 +137,33 @@ function get_bus!(mpc::Case, ID::String)::DataFrameRow
 end
 
 function get_loaddata(mpc::Case, bus_id::String)::DataFrame
-    return mpc.loaddata[mpc.loaddata.ID.==bus_id,:]
+    return mpc.loaddata[mpc.loaddata.bus.==bus_id,:]
 end
 
 function get_gen(mpc::Case, bus_id::String)::DataFrame
-    return mpc.gen[mpc.gen.ID.==bus_id,:]
+    return mpc.gen[mpc.gen.bus.==bus_id,:]
 end
 
 function get_gen!(mpc::Case, bus_id::String)::DataFrame
-    return mpc.gen[mpc.gen.ID.==bus_id, !]
+    return mpc.gen[mpc.gen.bus.==bus_id, !]
 end
 
 function get_branch_type(branch::DataFrame, f_bus::String, t_bus::String)::DataFrame
     temp = branch[(branch.f_bus .== f_bus) .&
-                      (branch.t_bus .== t_bus),:]
-	if isempty(temp)
-		temp = branch[(branch.t_bus .== f_bus) .&
-               (branch.f_bus .== t_bus),:]
-		   end
+                  (branch.t_bus .== t_bus),:]
+    if isempty(temp)
+        temp = branch[(branch.t_bus .== f_bus) .&
+       (branch.f_bus .== t_bus),:]
+   end
    return temp
 end
 
 function get_branch(mpc::Case, f_bus::String, t_bus::String)::DataFrame
-	get_branch_type(mpc.branch, f_bus, t_bus)
+    get_branch_type(mpc.branch, f_bus, t_bus)
 end
 
 function get_switch(mpc::Case, f_bus::String, t_bus::String)::DataFrame
-	get_branch_type(mpc.switch, f_bus, t_bus)
+    get_branch_type(mpc.switch, f_bus, t_bus)
 end
 
 function get_indicator(mpc::Case, f_bus::String, t_bus::String)::DataFrame
@@ -181,7 +185,7 @@ end
 function get_branch_data(mpc::Case, type::Symbol, column::Symbol, f_bus::String, t_bus::String)
 	temp = get_branch_data(mpc, type, f_bus, t_bus)
 	if String(column) in names(temp)
-		return temp[column]
+		return temp[!, column]
 	else
 		return nothing
 	end
@@ -312,8 +316,8 @@ end
 function get_power_injection_vector(case::Case)::Array{Float64, 1}
     Pd = -case.bus[:, :Pd]
     Pg = zeros(length(Pd), 1)
-    for gen in eachrow(case.gen)
-        Pg[gen.bus] = gen.Pg
+	for (idx, gen) in enumerate(eachrow(case.gen))
+        Pg[idx] = gen.Pg
     end
     return Pg[:] + Pd
 end
@@ -371,21 +375,52 @@ function to_ppc(mpc::Case)::Dict{String, Any}
 	return case
 end
 
+
+"""Returns all branch data in one dataframe.
+Merges the reldata, transformer, switches, and branch dataframes."""
+function branch_report(mpc::Case)::DataFrame
+    df = deepcopy(mpc.branch)
+    insertcols!(df, ncol(df)+1, :length => 0.0)
+    insertcols!(df, ncol(df)+1, :switch => false)
+    insertcols!(df, ncol(df)+1, :remote => false)
+    insertcols!(df, ncol(df)+1, :transformer => false)
+    insertcols!(df, ncol(df)+1, :indicator => false)
+    for branch in eachrow(df)
+        if is_switch(mpc, branch.f_bus, branch.t_bus)
+            branch.switch = true
+            switch = get_switch(mpc, branch.f_bus, branch.t_bus)
+            branch.remote = switch.remote[1]
+        elseif is_transformer(mpc, branch.f_bus, branch.t_bus)
+            branch.transformer = true
+        elseif is_indicator(mpc, branch.f_bus, branch.t_bus)
+            branch.indicator = true
+        else
+            rel = mpc.reldata[(mpc.reldata.f_bus .== branch.f_bus) .& (mpc.reldata.t_bus .== branch.t_bus), :length]
+            if isempty(rel)
+                rel = mpc.reldata[(mpc.reldata.f_bus .== branch.t_bus) .& (mpc.reldata.t_bus .== branch.f_bus), :length]
+            end
+            branch.length = rel[1]
+        end
+    end
+    return df
+end
+
+
 """ Returns the number of buses in the case."""
 function get_n_buses(mpc::Case)::Int64
-	nrow(mpc.bus)
+    nrow(mpc.bus)
 end
 
 """ Returns the row number of a bus given by id"""
 function get_bus_row(mpc::Case, id)::Int64
-	row = findall(mpc.bus.ID .== id)
-	if length(row) == 0
-		error(string("Bus with ID ", repr(id), " not found."))
-	elseif length(row) > 1
-		error(string("Multiple buses with the ID ", repr(id)))
-	else
-		return row[1]
-	end
+    row = findall(mpc.bus.ID .== id)
+    if length(row) == 0
+        error(string("Bus with ID ", repr(id), " not found."))
+    elseif length(row) > 1
+        error(string("Multiple buses with the ID ", repr(id)))
+    else
+        return row[1]
+    end
 end
 
 """ Sets branch to out of service"""
